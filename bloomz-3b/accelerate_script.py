@@ -3,24 +3,31 @@
 import torch
 from accelerate import Accelerator
 from datasets import load_dataset
-#from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 from transformers import DataCollatorForLanguageModeling
 import time
-import msamp
 
-model_name = "bigscience/bloomz-3b"
+model_name = "/home/scratch.beiw_sw/datasets/llama-7bf-hf"
 dataset_name = "timdettmers/openassistant-guanaco"
 dataset_text_field = "text"
 learning_rate = 1.41e-5
 batch_size = 8
 max_seq_length = 256
-gradient_accumulation_steps = 2
+gradient_accumulation_steps = 1
 peft_lora_r = 64
 peft_lora_alpha = 16
 num_training_steps=200
+
+peft_config = LoraConfig(
+    r=peft_lora_r,
+    lora_alpha=peft_lora_alpha,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=["query_key_value"]
+)
 
 
 model = AutoModelForCausalLM.from_pretrained(
@@ -28,6 +35,13 @@ model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True,
     torch_dtype=torch.bfloat16,
 )
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") 
+model.to(device)
+
+print("torch.jit.is_scripting()=",torch.jit.is_scripting())
+
+#model = get_peft_model(model, peft_config)
 
 
 def get_dataloaders(accelerator:Accelerator, batch_size:int = 8):
@@ -79,23 +93,23 @@ accelerator = Accelerator(log_with="wandb", gradient_accumulation_steps=gradient
 accelerator.print(f'State: {accelerator.state}')
 train_dataloader = get_dataloaders(accelerator, batch_size)
 
-optimizer = AdamW(params = model.parameters(), lr=learning_rate)
 
+#for p in model.parameters():
+#        print(p.name, p.data.dtype)
+        
+optimizer = AdamW(params = model.parameters(), lr=learning_rate, fused=True)
+                     
 lr_scheduler = get_linear_schedule_with_warmup(
     optimizer=optimizer,
     num_warmup_steps=100,
     num_training_steps=num_training_steps,
 )
 
-model, optimizer = msamp.initialize(model, optimizer, opt_level="O2")
-
-train_dataloader, lr_scheduler = accelerator.prepare(
-    train_dataloader, lr_scheduler
+model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+    model, optimizer, train_dataloader, lr_scheduler
 )
 
-model.to(accelerator.device)
-
-accelerator.init_trackers("fp8-benchmarks", config={
+accelerator.init_trackers("fp8-benchmarks-viking133", config={
     "model_name": model_name,
     "dataset_name": dataset_name,
     "batch_size": batch_size,
@@ -113,15 +127,40 @@ for _ in range(100):
     if completed_steps >= num_training_steps:
         break   
     for step, batch in enumerate(train_dataloader):
+        if step == 150:
+            torch.cuda.cudart().cudaProfilerStart()
+        if step == 151:
+            torch.cuda.cudart().cudaProfilerStop()
+            
+        torch.cuda.nvtx.range_push(f"step_{step}")        
         with accelerator.accumulate(model):
+            #outputs = model(**batch)
+            #loss = outputs.loss
+            #total_loss += loss.detach().float()
+            #accelerator.backward(loss)
+            #optimizer.step()
+            #lr_scheduler.step()
+            #optimizer.zero_grad()
+            torch.cuda.nvtx.range_push(f"forward")
             outputs = model(**batch)
+            # print_memory("after forward")
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push(f"loss")
             loss = outputs.loss
             total_loss += loss.detach().float()
+            # print_memory("after loss")
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push(f"backward")
             accelerator.backward(loss)
+            # print_memory("after backward")
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push(f"optimizer")
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-
+            # print_memory("after optimizer")
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()                                                                                                                                                                                                                                    
         if accelerator.sync_gradients:
             completed_steps += 1
         
